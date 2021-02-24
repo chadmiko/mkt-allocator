@@ -42,9 +42,8 @@ def main(argv=None):
     args = argparser.parse_args()
 
     context = {
-        'documents': list(),
+        'documents': None,
         'datafile': None,
-        'database': Database(),
         'output_dir': None,
         'output': dict(),
         'filter_column': None,
@@ -58,23 +57,18 @@ def main(argv=None):
 
         run = True
         while run:
-            try:
-                opt = prompt_menu(context)
-                if -1 == opt:
-                    print("Shutting down...")
-                    run = False
-                    break
-                # returns a function or None
-                handler = handle_option(opt)
-                if handler == None:
-                    print("Invalid selection, try again.")
-                else:
-                    handler(context)
-                    time.sleep(1)
-            except Exception as e:
-                print("ERROR: {}" % str(e))
-
-
+            opt = prompt_menu(context)
+            if -1 == opt:
+                print("Shutting down...")
+                run = False
+                break
+            # returns a function or None
+            handler = handle_option(opt)
+            if handler == None:
+                print("Invalid selection, try again.")
+            else:
+                handler(context)
+                time.sleep(1)
         print("Goodbye!")
     else:
         print("non interactive mode")

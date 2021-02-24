@@ -1,27 +1,11 @@
 import os
 import pathlib
 import csv
+import copy
 import atexit
 from collections import defaultdict
-
-class Database:
-    def __init__(self):
-        self.db = dict()
-        
-    def get(self, key):
-        return self.db.get(key, set())
-
-    def add(self, key, value):
-        current = self.get(key)
-        if type(value) in [list]:
-            current.update(value)
-        else:
-            current.update([value])
-        return self.db.update({key: current})
-
-    def __len__(self):
-        return len(self.db)
-        
+from itertools import chain
+      
 def split_by_n(seq:str, n:int):
     """
     A generator to divide a sequence into chunks of n units.
@@ -30,38 +14,114 @@ def split_by_n(seq:str, n:int):
         yield seq[:n]
         seq = seq[n:]
 
+class Document:
+    """ A bucket representing data to be assigned
+
+    buffer: Dict<str, list>   Data to be written to a file
+    expectations: Set  (set of criteria document expects to receive data from)
+    """
+    def __init__(self, label):
+        self.label = label
+        self.buffer = dict()
+        self.expectations = set()
+
+    def expect(self, criteria):
+        self.expectations.add(criteria)
+
+    def is_expecting(self, criteria):
+        return criteria in self.expectations
+
+    def cancel(self, criteria):
+        """ remove element from set if exists, no key error """
+        self.expectations.discard(criteria)
+
+    def add(self, key, value):
+        if key not in self.buffer:
+            self.buffer[key] = list()
+
+        self.buffer[key].append(value)
+        
+    def get(self, key):
+        return self.buffer.get(key, list())
+
+    def update(self, key):
+        return self.buffer.update(key)
+
+    def save_buffer(self, outdir, storage, header=None):
+        path = os.path.join(outdir, f"{self.label}.csv")
+        with open(path, 'w') as f:
+            w = storage(f)
+            if header:
+                w.writerow(header)
+                
+            for values in self.buffer.values():
+                w.writerows(values)
+        ret = copy.copy(self.buffer)
+        self.buffer.clear()
+        return ret
+
+    @property
+    def buffer_length(self):
+        return sum(len(v) for v in self.buffer.values())
+
+    def __iter__(self):
+        yield self
+
+    def __str__(self):
+        return self.label
+
+    def __cmp__(self, other):
+        """ This is apparently slower than using lambda function"""
+        return cmp(self.buffer_length, other.buffer_length)
+
 class DocumentList:
     def __init__(self, docdir):
         docpath = pathlib.Path(docdir)
         if not os.path.exists(docpath):
             raise FileNotFoundError('Doc Dir not found.')
         
-        all_docs = []
-        all_docs.extend(self._walk_files(docpath))
-        self.items = all_docs
-        self.index = 0
+        self.members = dict()
+        for doc in self._walk_files(docpath):
+            key = doc.label
+            self.members[key] = doc
+
+    def save(self, outdir):
+        for member in self.members:
+            member.save(outdir, csv)
+
+    def get_documents_expecting(self, criteria):
+        """ Returns a sorted list of documents expecting 
+        to be allocated `criteria`. """
+        items = [m for m in self.members.values() if m.is_expecting(criteria)]
+        return sorted(items, key=lambda x: x.buffer_length, reverse=True)
+        
+    def labels(self):
+        return self.keys()
+
+    def keys(self):
+        return self.members.keys()
+
+    def items(self):
+        return self.members.items()
+
+    def values(self):
+        return self.members.values()
 
     def __iter__(self):
-        yield self.items
+        return iter(self.members)
     
-    def __next__(self):
-        try:
-            item = self.items[self.index]
-        except IndexError:
-            raise StopIteration()
-        self.index += 1
-        return item
+    def __getitem__(self, name):
+        return self.members[name]
     
     def __len__(self):
-        return len(self.items)
+        return len(self.members)
         
     def _walk_files(self, path):
         docs = []
         for (dirpath, dirnames, filenames) in os.walk(path):
-            docs.extend(filenames)
+            docs.extend(map(Document, filenames))
             break
         return docs
-        
 
 class Datafile:
     def __init__(self, datapath):
@@ -69,14 +129,23 @@ class Datafile:
         if not os.path.exists(path_obj):
             raise FileNotFoundError('Datafile not found.')
         self.path = path_obj
+        atexit.register(self.cleanup)
         self.fh = open(self.path, 'r')
         self._header = self._read_header()
-        atexit.register(self.cleanup)
+
+    def contents(self, reader):
+        """ Returns an iterator """
+        self.rewind()
+        contents = reader(self.fh)
+        _ = next(contents)
+        return contents
 
     @property
     def header(self):
         if len(self._header) > 0:
             return self._header
+        else:
+            return list()
 
     def rewind(self, pos=0):
         self.fh.seek(pos)
@@ -95,41 +164,25 @@ class Datafile:
             except Exception:
                 pass
     
-                    
-class GroupedDatafile(Datafile):
-    def __init__(self, datapath, column):
-        super().__init__(datapath)
-        self.rows = {}
-        self._readfile(column)
 
-    def __getitem__(self, key):
-        return self.rows[key]
+def allocate(datafile, doc_list, column):
+    """ 
+    Fill Strategies:
+    - Equal:  share equally between documents for a given criteria
+    """
+    i = datafile.header.index(column)
+    reader = csv.reader
+    contents = datafile.contents(reader)
+    nobody = Document('nobody')
 
-    def __iter__(self):
-        return iter(self.rows)
+    for row in contents:
+        value = row[i] # e.g. 15601
+        try:
+            doc = doc_list.get_documents_expecting(value)[-1]
+            doc.add(value, row)
+        except IndexError:
+            nobody.add(value, row)
 
-    def keys(self):
-        return self.rows.keys()
+    print("Note: allocated %s items to %s." % (nobody.buffer_length, nobody.label))
+    return nobody
 
-    def items(self):
-        return self.rows.items()
-
-    def values(self):
-        return self.rows.values()
-
-    def _readfile(self, column):
-        items = dict()
-        with open(self.path, 'r') as f:
-            csv_file = csv.reader(f)
-            # skip header
-            _ = next(csv_file)
-            i = self.header.index(column)
-
-            # group rows by column value e.g. Zipcode
-            for row in csv_file:
-                if row[i] not in items:
-                    items[row[i]] = []
-                items[row[i]].append(row)
-            
-            self.rows = items
-        

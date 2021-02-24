@@ -11,20 +11,9 @@ import os
 import csv
 import time
 
-from .model import Datafile, DocumentList
+from .model import Datafile, DocumentList, allocate
 
-# subroutine to Option 5: Select Data file
-def data_filepath_prompt(context):
-    path_completer = PathCompleter(only_directories=False)
-    selected_datafile_path = prompt(
-        "Select Input Data file: ", completer=path_completer
-    )
-    print("%s...done." % selected_datafile_path)
-   
-    context['datafile'] = Datafile(selected_datafile_path)
-    return selected_datafile_path
-
-# subroutine to Option 1: Select Documents
+# subroutine to Option 1: Select Documents from Path
 def doc_filepath_prompt(context):
     path_completer = PathCompleter(only_directories=True)
     selected_doc_path = prompt(
@@ -39,7 +28,6 @@ def select_document_prompt(docs):
     while True:
         print("Documents to choose from: ")
         [print(doc) for doc in docs]
-        print(docs)
         document_completer = FuzzyWordCompleter(docs)
         selected_document = prompt(
             "Select Document: ", completer=document_completer
@@ -52,15 +40,19 @@ def select_document_prompt(docs):
 
 # Option 1:  map zipcode criteria to a document
 def assign_document_filters_prompt(context):
-    if len(context['documents']) < 1:
+    new_docs = True
+    if context['documents']:
+        new_docs = False
+
+    if new_docs:
         doc_filepath_prompt(context)
 
     complete = False
     values = []
-    documents = context['documents'].items
+    labels = context['documents'].keys()
 
     while not complete:
-        selected_doc = select_document_prompt(documents)
+        selected_doc = select_document_prompt(labels)
         valid_values = False
         
         while not valid_values:
@@ -74,7 +66,7 @@ Enter criteria (i.e. zipcodes) separated by commas: """ % (selected_doc)
                 #TODO Remove existing doc mappings?
                 valid_values = True
                 for value in values:
-                    context['database'].add(value, selected_doc)
+                    context['documents'][selected_doc].expect(value)
                 print("Values assigned ok!")
                 complete = True
             else:
@@ -82,49 +74,80 @@ Enter criteria (i.e. zipcodes) separated by commas: """ % (selected_doc)
 
     return values
 
-# Option 4:  Print mappings
+# Option 2:  Print mappings
 def print_mappings(context):
-    tpl = "{}: {}"
-    items = context['database'].db.items()
-
-    if len(items) < 1:
+    if len(context['documents']) < 1:
         print("No mappings to print.")
         return 
 
+    tpl = "{}: {}"
+
     print("Filter Mappings:\n" + ('-'*20))
-    for k, v in items:
-        print(tpl.format(k, ', '.join(list(v))))
+    for doc in context['documents'].values():
+        print(tpl.format(doc.label, ', '.join(sorted(list(doc.expectations)))))
 
 
 # subroutine on Option 5
 def output_dir_prompt(context):
-    path_completer = PathCompleter(only_directories=True)
-    output_dir = None
+    newdir = True
 
-    while True:
-        output_dir = prompt(
-            "Select an Output Directory to store output files:", completer=path_completer
+    if context['output_dir'] and os.path.exists(context['output_dir']):
+        print("Use existing output directory: %s?" % context['output_dir'])
+        answer = prompt("Type 'Y' to use existing directory, 'N' to enter new directory: ", \
+            completer=WordCompleter(['Y', 'N']))
+
+        if answer == 'Y':
+            newdir = False
+           
+
+    if newdir:
+        path_completer = PathCompleter(only_directories=True)
+        output_dir = None
+
+        while True:
+            output_dir = prompt(
+                "Select an Output Directory to store output files:", completer=path_completer
+            )
+            path_obj = pathlib.Path(output_dir)
+            if os.path.exists(path_obj):
+                context['output_dir'] = path_obj
+                print("Output directory is %s" % path_obj)
+                break
+            print("Invalid directory, try again.")
+
+    return context['output_dir']
+
+# subroutine to Option 5: Select Data file
+def data_filepath_prompt(context):
+    newfile = True
+
+    if context['datafile']:
+        completer = WordCompleter(['Y', 'N'])
+        print('Found datafile:  %s' % context['datafile'].path)
+        reuse = prompt("Type 'Y' to use existing datafile, 'N' to select other datafile:", completer=completer)
+
+        if reuse != 'Y':
+            newfile = True
+        else:
+            newfile = False
+
+    if newfile:
+        path_completer = PathCompleter(only_directories=False)
+        selected_datafile_path = prompt(
+            "Select Input Data file: ", completer=path_completer
         )
-        path_obj = pathlib.Path(output_dir)
-        if os.path.exists(path_obj):
-            context['output_dir'] = path_obj
-            print("Output directory is %s" % path_obj)
-            break
-        print("Invalid directory, try again.")
-
-    return path_obj
+        context['datafile'] = Datafile(selected_datafile_path)
+    
+    return context['datafile']
 
 # Option 5
-def write_filtered_files_prompt(context):
-    if not context['datafile']:
-        data_filepath_prompt(context)
+def allocate_datafile_prompt(context):
+    # Todo consider getting datafile at runtime to allow
+    # For one configuration to apply to multiple data files
+    datafile = data_filepath_prompt(context)
+    output_dir = output_dir_prompt(context)
     
-    if not context['output_dir']:
-        output_dir_prompt(context)
-    
-    if len(context['database']) < 1:
-        print("No mappings configured, abort. (HINT: try option 3)")
-        return
+    # TODO test documents for mappings
 
     column = False
     header = context['datafile'].header
@@ -135,61 +158,25 @@ def write_filtered_files_prompt(context):
         column = prompt(
             "Enter a Column to filter on: ", completer=column_completer
         )
-        if column and column in header:
-            context['filter_column'] = column
+        if column in header:
             break
         column = False
         print("Invalid entry, try again (must choose an item from the list).")
 
-    groups = {}
-
-    context['datafile'].rewind()
-    csv_file = csv.reader(context['datafile'].fh)
-    _ = next(csv_file) # skip header
-    i = context['datafile'].header.index(column)
+    writer = csv.writer
+    nobody = allocate(datafile, context['documents'], column)
+    nobody.save_buffer(output_dir, writer)
+    # TODO iterate on documents, not documents.values
+    [doc.save_buffer(output_dir, writer, header) for doc in context['documents'].values()]
     
-    for row in csv_file:
-        value = row[i]  # e.g. 15601
-        if value not in groups:
-            groups[value] = []
-        groups[value].append(row)
-    
-    # write separate files for each group
-    unassigned = list()
-    result = dict()
-
-    for value, rows in groups.items():
-        #path = os.path.join(context['output_dir'], f"{filter_val}.csv"
-        docs = context['database'].get(value)
-        num_recipients = len(docs)
-
-        if num_recipients == 1:
-            doc = docs.pop()
-            result[doc] = rows 
-        else: 
-            #TODO THIS DOESN'T WORK
-            if docs_length > 0:
-                if docs_length < num_recipients:
-                    print("WARN: {} has more documents than data available." % value)
-                bucket_size = max(math.floor(len(rows)/num_recipients), 1)
-                
-                for bucket in split_by_n(rows, bucket_size):
-                
-
-            # check for odd lot last bucket
-            else:
-                print("{} is unallocated and will be saved to nobody.csv" % value)
-
-        
-    
+    print("Done.  Files saved to {}".format(output_dir))
 
 def prompt_menu(context):
     menu = """
 Select one:
 1: Map Filter Criteria to Document
 2: Print Filter Mappings
-5: Write Filtered Files
-9: Generate Output Files
+3: Allocate a Datafile to Documents
 Q: Quit 
 
 Enter number or Q to quit:  """
@@ -202,7 +189,7 @@ Enter number or Q to quit:  """
             break
         try:
             option = int(selected_item)
-            if option in [1,2,5,9]:
+            if option in [1,2,3]:
                 break
         except ValueError:
             pass #trap it
@@ -215,7 +202,7 @@ def handle_option(opt):
     choices = {
         1: assign_document_filters_prompt,
         2: print_mappings,
-        5: write_filtered_files_prompt,
+        3: allocate_datafile_prompt,
     }
     return choices.get(opt, None)
 
